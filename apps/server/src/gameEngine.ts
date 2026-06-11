@@ -13,6 +13,7 @@ export interface ActiveGame {
   votes: Record<string, string>;
   confirmedVotes: Set<string>;
   helperHint?: string; // Stored hint from ChatGPT Helper
+  transitioning?: boolean; // Block concurrent phase transitions
 }
 
 export const activeGames: Record<string, ActiveGame> = {};
@@ -91,165 +92,172 @@ export function startGameTicker(io: Server) {
 
 export async function transitionToNextPhase(io: Server, roomId: string) {
   const game = activeGames[roomId];
-  if (!game) return;
+  if (!game || game.transitioning) return;
+  game.transitioning = true;
 
-  const room = await prisma.room.findUnique({
-    where: { id: roomId },
-    include: { players: { include: { user: true } } }
-  });
-  if (!room) return;
-
-  const settings = typeof room.settings === 'string'
-    ? JSON.parse(room.settings) as RoomSettings
-    : room.settings as unknown as RoomSettings;
-
-  if (game.phase === 'NIGHT') {
-    // NIGHT -> DAY
-    const result = await resolveNightActions(roomId, game);
-    
-    // Check if the game has ended
-    const winner = await checkWinConditions(roomId);
-    if (winner) {
-      await endGame(io, roomId, winner);
-      return;
-    }
-
-    game.phase = 'DAY';
-    game.timeLeft = settings.timeouts.day || 120;
-    game.votes = {};
-    game.confirmedVotes.clear();
-
-    await prisma.room.update({
+  try {
+    const room = await prisma.room.findUnique({
       where: { id: roomId },
-      data: { status: 'DAY' }
+      include: { players: { include: { user: true } } }
     });
+    if (!room) return;
 
-    io.to(roomId).emit('night:result', {
-      eliminatedId: result.eliminatedId,
-      savedId: result.savedId
-    });
+    const settings = typeof room.settings === 'string'
+      ? JSON.parse(room.settings) as RoomSettings
+      : room.settings as unknown as RoomSettings;
 
-    // 1. Broadcast ChatGPT Helper hint if any was submitted
-    if (game.helperHint) {
-      io.to(roomId).emit('day:message', {
-        senderId: 'GPT_HELPER',
-        senderName: 'ChatGPT Help Desk',
-        avatar: null,
-        message: `💡 Campus Suggestion: "${game.helperHint}"`,
-        timestamp: new Date().toISOString()
+    if (game.phase === 'NIGHT') {
+      // NIGHT -> DAY
+      const result = await resolveNightActions(roomId, game);
+      
+      // Check if the game has ended
+      const winner = await checkWinConditions(roomId);
+      if (winner) {
+        await endGame(io, roomId, winner);
+        return;
+      }
+
+      game.phase = 'DAY';
+      game.timeLeft = settings.timeouts.day || 120;
+      game.votes = {};
+      game.confirmedVotes.clear();
+
+      await prisma.room.update({
+        where: { id: roomId },
+        data: { status: 'DAY' }
+      });
+
+      io.to(roomId).emit('night:result', {
+        eliminatedId: result.eliminatedId,
+        savedId: result.savedId
+      });
+
+      // 1. Broadcast ChatGPT Helper hint if any was submitted
+      if (game.helperHint) {
+        io.to(roomId).emit('day:message', {
+          senderId: 'GPT_HELPER',
+          senderName: 'ChatGPT Help Desk',
+          avatar: null,
+          message: `💡 Campus Suggestion: "${game.helperHint}"`,
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      // 2. Generate and privately send dynamic rumor to Canteen Spy (if alive)
+      const canteenSpy = room.players.find(p => p.role === 'CANTEEN_SPY' && p.isAlive);
+      if (canteenSpy) {
+        const actionsList = Object.values(game.nightActions);
+        const mafiaAct = actionsList.find(a => a.role === 'ASSIGNMENT_MAFIA');
+        const teacherAct = actionsList.find(a => a.role === 'TEACHER');
+        const policeAct = actionsList.find(a => a.role === 'ATTENDANCE_POLICE');
+
+        const rumors = [];
+
+        if (mafiaAct) {
+          const targetPlayer = room.players.find(p => p.userId === mafiaAct.targetId);
+          if (targetPlayer) {
+            rumors.push(`Someone heard whispers about a group project sabotage targeting ${targetPlayer.user.name}.`);
+          }
+        }
+        if (teacherAct) {
+          rumors.push("A student saw a professor auditing grade records late in the academic office.");
+        }
+        if (policeAct) {
+          const targetPlayer = room.players.find(p => p.userId === policeAct.targetId);
+          if (targetPlayer) {
+            rumors.push(`Someone was spotted signing a proxy attendance sheet for ${targetPlayer.user.name} in the lecture hall.`);
+          }
+        }
+
+        let rumorText = '';
+        if (rumors.length > 0) {
+          rumorText = rumors[Math.floor(Math.random() * rumors.length)];
+        } else {
+          const localRumors = [
+            "Kitchen staff says the samosas might be made from yesterday's dough.",
+            "A student was seen sleeping in the reference section of the central library.",
+            "The WiFi in the hostel blocks is rumored to go down tonight.",
+            "Rumor has it a student has been taking extra help from ChatGPT for their assignments."
+          ];
+          rumorText = localRumors[Math.floor(Math.random() * localRumors.length)];
+        }
+
+        io.to(`user:${canteenSpy.userId}`).emit('day:message', {
+          senderId: 'CANTEEN_SPY_WHISPER',
+          senderName: 'Canteen Rumors',
+          avatar: null,
+          message: `🤫 Kitchen Whispers: ${rumorText}`,
+          timestamp: new Date().toISOString()
+        });
+      }
+
+      // Clear nightActions after rumors and hints have been processed
+      game.nightActions = {};
+
+      io.to(roomId).emit('phase:change', {
+        phase: 'DAY',
+        duration: game.timeLeft,
+        roundNumber: game.roundNumber
+      });
+
+    } else if (game.phase === 'DAY') {
+      // DAY -> VOTING
+      game.phase = 'VOTING';
+      game.timeLeft = settings.timeouts.voting || 60;
+      game.votes = {};
+      game.confirmedVotes.clear();
+
+      await prisma.room.update({
+        where: { id: roomId },
+        data: { status: 'VOTING' }
+      });
+
+      io.to(roomId).emit('phase:change', {
+        phase: 'VOTING',
+        duration: game.timeLeft,
+        roundNumber: game.roundNumber
+      });
+
+    } else if (game.phase === 'VOTING') {
+      // VOTING -> NIGHT (or ENDED)
+      const result = await resolveVotes(roomId, game, settings);
+      
+      const winner = await checkWinConditions(roomId);
+      if (winner) {
+        await endGame(io, roomId, winner);
+        return;
+      }
+
+      game.phase = 'NIGHT';
+      game.timeLeft = settings.timeouts.night || 60;
+      game.roundNumber += 1;
+      game.votes = {};
+      game.confirmedVotes.clear();
+      game.nightActions = {};
+
+      await prisma.room.update({
+        where: { id: roomId },
+        data: { status: 'NIGHT' }
+      });
+
+      io.to(roomId).emit('vote:result', {
+        eliminatedId: result.eliminatedId,
+        voteBreakdown: result.voteBreakdown
+      });
+
+      io.to(roomId).emit('phase:change', {
+        phase: 'NIGHT',
+        duration: game.timeLeft,
+        roundNumber: game.roundNumber
       });
     }
-
-    // 2. Generate and privately send dynamic rumor to Canteen Spy (if alive)
-    const canteenSpy = room.players.find(p => p.role === 'CANTEEN_SPY' && p.isAlive);
-    if (canteenSpy) {
-      const actionsList = Object.values(game.nightActions);
-      const mafiaAct = actionsList.find(a => a.role === 'ASSIGNMENT_MAFIA');
-      const teacherAct = actionsList.find(a => a.role === 'TEACHER');
-      const policeAct = actionsList.find(a => a.role === 'ATTENDANCE_POLICE');
-
-      const rumors = [];
-
-      if (mafiaAct) {
-        const targetPlayer = room.players.find(p => p.userId === mafiaAct.targetId);
-        if (targetPlayer) {
-          rumors.push(`Someone heard whispers about a group project sabotage targeting ${targetPlayer.user.name}.`);
-        }
-      }
-      if (teacherAct) {
-        rumors.push("A student saw a professor auditing grade records late in the academic office.");
-      }
-      if (policeAct) {
-        const targetPlayer = room.players.find(p => p.userId === policeAct.targetId);
-        if (targetPlayer) {
-          rumors.push(`Someone was spotted signing a proxy attendance sheet for ${targetPlayer.user.name} in the lecture hall.`);
-        }
-      }
-
-      let rumorText = '';
-      if (rumors.length > 0) {
-        rumorText = rumors[Math.floor(Math.random() * rumors.length)];
-      } else {
-        const localRumors = [
-          "Kitchen staff says the samosas might be made from yesterday's dough.",
-          "A student was seen sleeping in the reference section of the central library.",
-          "The WiFi in the hostel blocks is rumored to go down tonight.",
-          "Rumor has it a student has been taking extra help from ChatGPT for their assignments."
-        ];
-        rumorText = localRumors[Math.floor(Math.random() * localRumors.length)];
-      }
-
-      io.to(`user:${canteenSpy.userId}`).emit('day:message', {
-        senderId: 'CANTEEN_SPY_WHISPER',
-        senderName: 'Canteen Rumors',
-        avatar: null,
-        message: `🤫 Kitchen Whispers: ${rumorText}`,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    // Clear nightActions after rumors and hints have been processed
-    game.nightActions = {};
-
-    io.to(roomId).emit('phase:change', {
-      phase: 'DAY',
-      duration: game.timeLeft,
-      roundNumber: game.roundNumber
-    });
-
-  } else if (game.phase === 'DAY') {
-    // DAY -> VOTING
-    game.phase = 'VOTING';
-    game.timeLeft = settings.timeouts.voting || 60;
-    game.votes = {};
-    game.confirmedVotes.clear();
-
-    await prisma.room.update({
-      where: { id: roomId },
-      data: { status: 'VOTING' }
-    });
-
-    io.to(roomId).emit('phase:change', {
-      phase: 'VOTING',
-      duration: game.timeLeft,
-      roundNumber: game.roundNumber
-    });
-
-  } else if (game.phase === 'VOTING') {
-    // VOTING -> NIGHT (or ENDED)
-    const result = await resolveVotes(roomId, game, settings);
     
-    const winner = await checkWinConditions(roomId);
-    if (winner) {
-      await endGame(io, roomId, winner);
-      return;
+    await emitRoomUpdate(io, roomId);
+  } finally {
+    if (activeGames[roomId]) {
+      activeGames[roomId].transitioning = false;
     }
-
-    game.phase = 'NIGHT';
-    game.timeLeft = settings.timeouts.night || 60;
-    game.roundNumber += 1;
-    game.votes = {};
-    game.confirmedVotes.clear();
-    game.nightActions = {};
-
-    await prisma.room.update({
-      where: { id: roomId },
-      data: { status: 'NIGHT' }
-    });
-
-    io.to(roomId).emit('vote:result', {
-      eliminatedId: result.eliminatedId,
-      voteBreakdown: result.voteBreakdown
-    });
-
-    io.to(roomId).emit('phase:change', {
-      phase: 'NIGHT',
-      duration: game.timeLeft,
-      roundNumber: game.roundNumber
-    });
   }
-  
-  await emitRoomUpdate(io, roomId);
 }
 
 async function resolveNightActions(roomId: string, game: ActiveGame) {
