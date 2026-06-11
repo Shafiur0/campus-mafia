@@ -136,8 +136,10 @@ async function runTest() {
       const allReady = room.players.every((p: any) => p.isReady);
       if (allReady && room.players.length === 4 && !startEmitted) {
         startEmitted = true;
-        console.log('All players ready! Starting game...');
-        socket1.emit('game:start', { roomId, userId: 'user-alice' });
+        console.log('All players ready! Waiting 500ms for database to sync, then starting game...');
+        setTimeout(() => {
+          socket1.emit('game:start', { roomId, userId: 'user-alice' });
+        }, 500);
       }
     });
 
