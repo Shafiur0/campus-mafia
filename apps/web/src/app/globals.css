@@ -1,0 +1,64 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #0A0B1E;
+    color: #F1F5F9;
+    font-family: var(--font-inter), sans-serif;
+  }
+}
+
+.glass-card {
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.neon-glow-primary {
+  box-shadow: 0 0 15px rgba(124, 58, 237, 0.4);
+  border-color: rgba(124, 58, 237, 0.6);
+}
+
+.neon-glow-accent {
+  box-shadow: 0 0 15px rgba(34, 211, 238, 0.4);
+  border-color: rgba(34, 211, 238, 0.6);
+}
+
+.neon-glow-danger {
+  box-shadow: 0 0 15px rgba(244, 63, 94, 0.4);
+  border-color: rgba(244, 63, 94, 0.6);
+}
+
+.neon-glow-success {
+  box-shadow: 0 0 15px rgba(16, 185, 129, 0.4);
+  border-color: rgba(16, 185, 129, 0.6);
+}
+
+.neon-text-primary {
+  text-shadow: 0 0 10px rgba(124, 58, 237, 0.6);
+}
+
+.neon-text-accent {
+  text-shadow: 0 0 10px rgba(34, 211, 238, 0.6);
+}
+
+/* 3D Transform Utilities */
+.perspective-1000 {
+  perspective: 1000px;
+}
+
+.preserve-3d {
+  transform-style: preserve-3d;
+}
+
+.backface-hidden {
+  backface-visibility: hidden;
+}
+
+.rotate-y-180 {
+  transform: rotateY(180deg);
+}
+

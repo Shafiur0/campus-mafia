@@ -1,0 +1,125 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id           String    @id @default(cuid())
+  name         String
+  email        String?   @unique
+  avatar       String?
+  isGuest      Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  stats        UserStats?
+  achievements Achievement[]
+  matches      MatchPlayer[]
+  roomPlayers  RoomPlayer[]
+  friends      Friendship[] @relation("UserFriends")
+  friendOf     Friendship[] @relation("FriendOf")
+}
+
+model UserStats {
+  id                 String  @id @default(cuid())
+  userId             String  @unique
+  user               User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  totalGames         Int     @default(0)
+  wins               Int     @default(0)
+  mafiaWins          Int     @default(0)
+  studentWins        Int     @default(0)
+  survivalRate       Float   @default(0)
+  investigationAcc   Float   @default(0)
+}
+
+model Room {
+  id           String    @id @default(cuid())
+  code         String    @unique  // 6-char alphanumeric
+  hostId       String
+  status       RoomStatus @default(LOBBY)  // LOBBY | NIGHT | DAY | VOTING | ENDED
+  settings     Json      // { maxPlayers, rolesConfig, votingMode, timeouts }
+  createdAt    DateTime  @default(now())
+  players      RoomPlayer[]
+  matches      Match[]
+}
+
+model RoomPlayer {
+  id        String  @id @default(cuid())
+  roomId    String
+  userId    String
+  role      Role?   // Assigned at game start
+  isAlive   Boolean @default(true)
+  isReady   Boolean @default(false)
+  room      Room    @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Match {
+  id          String    @id @default(cuid())
+  roomId      String
+  winningSide Side      // STUDENTS | MAFIA
+  summary     String?   // AI-generated funny summary
+  startedAt   DateTime
+  endedAt     DateTime?
+  players     MatchPlayer[]
+  room        Room      @relation(fields: [roomId], references: [id], onDelete: Cascade)
+}
+
+model MatchPlayer {
+  id        String   @id @default(cuid())
+  matchId   String
+  userId    String
+  role      Role
+  isAlive   Boolean
+  won       Boolean
+  match     Match    @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Friendship {
+  id         String   @id @default(cuid())
+  userId     String
+  friendId   String
+  status     String   // PENDING, ACCEPTED
+  createdAt  DateTime @default(now())
+  user       User     @relation("UserFriends", fields: [userId], references: [id], onDelete: Cascade)
+  friend     User     @relation("FriendOf", fields: [friendId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, friendId])
+}
+
+model Achievement {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        String   // LAST_BENCHER, ASSIGNMENT_DESTROYER, etc.
+  unlockedAt  DateTime @default(now())
+  
+  @@unique([userId, type])
+}
+
+enum Role {
+  STUDENT
+  ASSIGNMENT_MAFIA
+  TEACHER
+  ATTENDANCE_POLICE
+  CR
+  CANTEEN_SPY
+  CHATGPT_HELPER
+}
+
+enum RoomStatus {
+  LOBBY
+  NIGHT
+  DAY
+  VOTING
+  ENDED
+}
+
+enum Side {
+  STUDENTS
+  MAFIA
+}
+
