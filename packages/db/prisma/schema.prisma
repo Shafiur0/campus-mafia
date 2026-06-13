@@ -35,14 +35,22 @@ model UserStats {
 }
 
 model Room {
-  id           String    @id @default(cuid())
-  code         String    @unique  // 6-char alphanumeric
-  hostId       String
-  status       RoomStatus @default(LOBBY)  // LOBBY | NIGHT | DAY | VOTING | ENDED
-  settings     Json      // { maxPlayers, rolesConfig, votingMode, timeouts }
-  createdAt    DateTime  @default(now())
-  players      RoomPlayer[]
-  matches      Match[]
+  id             String      @id @default(cuid())
+  code           String      @unique  // 6-char alphanumeric
+  hostId         String
+  status         RoomStatus  @default(LOBBY)  // LOBBY | NIGHT | DAY | VOTING | ENDED
+  settings       Json        // { maxPlayers, rolesConfig, votingMode, timeouts }
+  createdAt      DateTime    @default(now())
+  players        RoomPlayer[]
+  matches        Match[]
+  
+  // Game state fields
+  roundNumber    Int         @default(1)
+  timeLeft       Int         @default(0)
+  nightActions   Json        @default("{}")
+  votes          Json        @default("{}")
+  confirmedVotes Json        @default("[]")
+  helperHint     String?
 }
 
 model RoomPlayer {

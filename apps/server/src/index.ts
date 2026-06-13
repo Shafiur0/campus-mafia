@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import jwt from 'jsonwebtoken';
 import { ClientToServerEvents, ServerToClientEvents } from '@campus-mafia/types';
 import { setupSocketHandlers } from './socket.js';
+import { recoverActiveGames } from './gameEngine.js';
 
 dotenv.config();
 
@@ -95,6 +96,7 @@ io.on('connection', (socket: AuthenticatedSocket) => {
   });
 });
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`Server is running on port ${PORT}`);
+  await recoverActiveGames(io);
 });

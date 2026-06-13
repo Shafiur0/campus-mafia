@@ -127,6 +127,29 @@ export function setupSocketHandlers(
       }
 
       await emitRoomUpdate(io, room.id);
+
+      // If rejoining an active game, send their role and abilities back to them
+      if (room.status !== 'LOBBY' && existingPlayer?.role) {
+        const role = existingPlayer.role;
+        let abilities: string[] = [];
+        if (role === 'ASSIGNMENT_MAFIA') {
+          abilities = ['Sabotage student assignments', 'Discuss in the secret Mafia chat channel', 'Vote to eliminate a student each night'];
+        } else if (role === 'TEACHER') {
+          abilities = ['Investigate a player each night to uncover their secret role'];
+        } else if (role === 'ATTENDANCE_POLICE') {
+          abilities = ['Protect one student from elimination each night'];
+        } else if (role === 'CR') {
+          abilities = ['Emergency Meeting: trigger discussion voting phase instantly during the day', 'Counts as 2 votes in class consensus'];
+        } else if (role === 'CANTEEN_SPY') {
+          abilities = ['Listen to whispers: get rumors from the campus kitchen'];
+        } else if (role === 'CHATGPT_HELPER') {
+          abilities = ['Generate and broadcast generic anonymous helpful suggestions at night'];
+        } else {
+          abilities = ['Deceive and survive', 'Vote during class discussion phases to eject suspects'];
+        }
+        
+        socket.emit('role:assigned', { role, abilities });
+      }
     } catch (err: any) {
       socket.emit('error', { code: 'ROOM_JOIN_FAILED', message: err.message || 'Failed to join room' });
     }
@@ -173,6 +196,10 @@ export function setupSocketHandlers(
         return;
       }
 
+      const settings = typeof room.settings === 'string'
+        ? JSON.parse(room.settings) as RoomSettings
+        : room.settings as unknown as RoomSettings;
+
       const notReady = room.players.filter(p => !p.isReady);
       if (notReady.length > 0) {
         socket.emit('error', { code: 'PLAYERS_NOT_READY', message: 'All players must be ready' });
@@ -213,15 +240,19 @@ export function setupSocketHandlers(
         io.to(`user:${player.userId}`).emit('role:assigned', { role, abilities });
       }
 
-      // Update room status
+      // Update room status and clear/initialize state
       await prisma.room.update({
         where: { id: roomId },
-        data: { status: 'NIGHT' }
+        data: {
+          status: 'NIGHT',
+          roundNumber: 1,
+          timeLeft: settings.timeouts.night || 60,
+          nightActions: {},
+          votes: {},
+          confirmedVotes: [],
+          helperHint: null
+        }
       });
-
-      const settings = typeof room.settings === 'string'
-        ? JSON.parse(room.settings) as RoomSettings
-        : room.settings as unknown as RoomSettings;
 
       // Initialize Active Game memory state
       activeGames[roomId] = {
@@ -289,8 +320,12 @@ export function setupSocketHandlers(
         return;
       }
 
-      // Record Action
+      // Record Action in memory and DB
       game.nightActions[uid] = { role: actionType, targetId };
+      await prisma.room.update({
+        where: { id: roomId },
+        data: { nightActions: game.nightActions }
+      });
 
       // Private feedback to Teacher
       if (actionType === 'TEACHER') {
@@ -406,8 +441,12 @@ export function setupSocketHandlers(
         return;
       }
 
-      // Record vote
+      // Record vote in memory and DB
       game.votes[uid] = targetId;
+      await prisma.room.update({
+        where: { id: roomId },
+        data: { votes: game.votes }
+      });
 
       // Tally current vote values
       const tally: Record<string, number> = {};
@@ -443,6 +482,10 @@ export function setupSocketHandlers(
       }
 
       game.confirmedVotes.add(uid);
+      await prisma.room.update({
+        where: { id: roomId },
+        data: { confirmedVotes: Array.from(game.confirmedVotes) }
+      });
 
       const aliveCount = await prisma.roomPlayer.count({
         where: { roomId, isAlive: true }
@@ -516,6 +559,14 @@ export function setupSocketHandlers(
 
       // Store hint to broadcast at daybreak
       game.helperHint = hint;
+
+      await prisma.room.update({
+        where: { id: roomId },
+        data: {
+          nightActions: game.nightActions,
+          helperHint: hint
+        }
+      });
 
       // Send a confirmation message to the Helper
       socket.emit('day:message', {

@@ -74,6 +74,11 @@ export function startGameTicker(io: Server) {
         continue;
       }
       
+      if (game.transitioning) {
+        console.log(`[startGameTicker] Skipping tick for room ${roomId} as transition is in progress.`);
+        continue;
+      }
+      
       game.timeLeft--;
       
       // Emit tick timer updates
@@ -91,15 +96,21 @@ export function startGameTicker(io: Server) {
 }
 
 export async function transitionToNextPhase(io: Server, roomId: string) {
+  console.log(`[transitionToNextPhase] Starting transition for room ${roomId}. Current phase: ${activeGames[roomId]?.phase}`);
   const game = activeGames[roomId];
-  if (!game || game.transitioning) return;
+  if (!game || game.transitioning) {
+    console.log(`[transitionToNextPhase] Aborting: game=${!!game}, transitioning=${game?.transitioning}`);
+    return;
+  }
   game.transitioning = true;
 
   try {
+    console.log(`[transitionToNextPhase] Fetching room details from DB...`);
     const room = await prisma.room.findUnique({
       where: { id: roomId },
       include: { players: { include: { user: true } } }
     });
+    console.log(`[transitionToNextPhase] Room fetched: exists=${!!room}`);
     if (!room) return;
 
     const settings = typeof room.settings === 'string'
@@ -107,11 +118,23 @@ export async function transitionToNextPhase(io: Server, roomId: string) {
       : room.settings as unknown as RoomSettings;
 
     if (game.phase === 'NIGHT') {
-      // NIGHT -> DAY
+      console.log(`[transitionToNextPhase] Resolving night actions...`);
       const result = await resolveNightActions(roomId, game);
+      console.log(`[transitionToNextPhase] Night actions resolved:`, result);
       
-      // Check if the game has ended
+      // Refetch the room players list to get fresh isAlive statuses for win conditions and rumor check
+      console.log(`[transitionToNextPhase] Refetching room players to avoid stale states...`);
+      const refreshedRoom = await prisma.room.findUnique({
+        where: { id: roomId },
+        include: { players: { include: { user: true } } }
+      });
+      if (refreshedRoom) {
+        room.players = refreshedRoom.players;
+      }
+      
+      console.log(`[transitionToNextPhase] Checking win conditions...`);
       const winner = await checkWinConditions(roomId);
+      console.log(`[transitionToNextPhase] Win conditions check result: winner=${winner}`);
       if (winner) {
         await endGame(io, roomId, winner);
         return;
@@ -122,10 +145,20 @@ export async function transitionToNextPhase(io: Server, roomId: string) {
       game.votes = {};
       game.confirmedVotes.clear();
 
+      console.log(`[transitionToNextPhase] Updating room status to DAY in DB...`);
       await prisma.room.update({
         where: { id: roomId },
-        data: { status: 'DAY' }
+        data: { 
+          status: 'DAY',
+          roundNumber: game.roundNumber,
+          timeLeft: game.timeLeft,
+          nightActions: {},
+          votes: {},
+          confirmedVotes: [],
+          helperHint: game.helperHint || null
+        }
       });
+      console.log(`[transitionToNextPhase] Room status updated in DB.`);
 
       io.to(roomId).emit('night:result', {
         eliminatedId: result.eliminatedId,
@@ -209,7 +242,12 @@ export async function transitionToNextPhase(io: Server, roomId: string) {
 
       await prisma.room.update({
         where: { id: roomId },
-        data: { status: 'VOTING' }
+        data: { 
+          status: 'VOTING',
+          timeLeft: game.timeLeft,
+          votes: {},
+          confirmedVotes: []
+        }
       });
 
       io.to(roomId).emit('phase:change', {
@@ -219,10 +257,13 @@ export async function transitionToNextPhase(io: Server, roomId: string) {
       });
 
     } else if (game.phase === 'VOTING') {
-      // VOTING -> NIGHT (or ENDED)
+      console.log(`[transitionToNextPhase] Resolving votes for room ${roomId}...`);
       const result = await resolveVotes(roomId, game, settings);
+      console.log(`[transitionToNextPhase] Votes resolved. result:`, result);
       
+      console.log(`[transitionToNextPhase] Checking win conditions after voting...`);
       const winner = await checkWinConditions(roomId);
+      console.log(`[transitionToNextPhase] Win conditions after voting: winner=${winner}`);
       if (winner) {
         await endGame(io, roomId, winner);
         return;
@@ -234,11 +275,22 @@ export async function transitionToNextPhase(io: Server, roomId: string) {
       game.votes = {};
       game.confirmedVotes.clear();
       game.nightActions = {};
+      game.helperHint = undefined;
 
+      console.log(`[transitionToNextPhase] Updating room status to NIGHT in DB...`);
       await prisma.room.update({
         where: { id: roomId },
-        data: { status: 'NIGHT' }
+        data: { 
+          status: 'NIGHT',
+          roundNumber: game.roundNumber,
+          timeLeft: game.timeLeft,
+          nightActions: {},
+          votes: {},
+          confirmedVotes: [],
+          helperHint: null
+        }
       });
+      console.log(`[transitionToNextPhase] Room status updated to NIGHT in DB.`);
 
       io.to(roomId).emit('vote:result', {
         eliminatedId: result.eliminatedId,
@@ -257,6 +309,74 @@ export async function transitionToNextPhase(io: Server, roomId: string) {
     if (activeGames[roomId]) {
       activeGames[roomId].transitioning = false;
     }
+  }
+}
+
+export async function recoverActiveGames(io: Server) {
+  console.log('[gameEngine] Recovering active games from database...');
+  try {
+    const activeRooms = await prisma.room.findMany({
+      where: {
+        status: {
+          in: ['NIGHT', 'DAY', 'VOTING']
+        }
+      },
+      include: {
+        players: {
+          include: {
+            user: true
+          }
+        }
+      }
+    });
+
+    console.log(`[gameEngine] Found ${activeRooms.length} active room(s) to recover.`);
+
+    for (const room of activeRooms) {
+      const settings = typeof room.settings === 'string'
+        ? JSON.parse(room.settings) as RoomSettings
+        : room.settings as unknown as RoomSettings;
+
+      let confirmedVotesArray: string[] = [];
+      if (room.confirmedVotes) {
+        confirmedVotesArray = Array.isArray(room.confirmedVotes)
+          ? (room.confirmedVotes as string[])
+          : JSON.parse(room.confirmedVotes as string);
+      }
+
+      let nightActionsObj: any = {};
+      if (room.nightActions) {
+        nightActionsObj = typeof room.nightActions === 'string'
+          ? JSON.parse(room.nightActions)
+          : room.nightActions;
+      }
+
+      let votesObj: any = {};
+      if (room.votes) {
+        votesObj = typeof room.votes === 'string'
+          ? JSON.parse(room.votes)
+          : room.votes;
+      }
+
+      activeGames[room.id] = {
+        roomId: room.id,
+        roundNumber: room.roundNumber,
+        phase: room.status as RoomStatus,
+        timeLeft: room.timeLeft,
+        nightActions: nightActionsObj,
+        votes: votesObj,
+        confirmedVotes: new Set(confirmedVotesArray),
+        helperHint: room.helperHint || undefined
+      };
+
+      console.log(`[gameEngine] Recovered room ${room.id} (${room.code}) - Round: ${room.roundNumber}, Phase: ${room.status}, Time Left: ${room.timeLeft}s`);
+    }
+
+    if (activeRooms.length > 0) {
+      startGameTicker(io);
+    }
+  } catch (err) {
+    console.error('[gameEngine] Error recovering active games:', err);
   }
 }
 
@@ -430,19 +550,25 @@ async function awardAchievements(userId: string) {
 }
 
 export async function endGame(io: Server, roomId: string, winningSide: Side) {
+  console.log(`[endGame] Initiating endGame for room ${roomId}, winningSide: ${winningSide}`);
   // Update database statuses
+  console.log(`[endGame] Updating room status to ENDED in DB...`);
   await prisma.room.update({
     where: { id: roomId },
     data: { status: 'ENDED' }
   });
+  console.log(`[endGame] Room status updated in DB.`);
 
+  console.log(`[endGame] Fetching room details from DB...`);
   const room = await prisma.room.findUnique({
     where: { id: roomId },
     include: { players: { include: { user: true } } }
   });
+  console.log(`[endGame] Room fetched. Exists=${!!room}`);
   if (!room) return;
 
   // Save the match results
+  console.log(`[endGame] Creating Match record in DB...`);
   const match = await prisma.match.create({
     data: {
       roomId,
@@ -452,10 +578,12 @@ export async function endGame(io: Server, roomId: string, winningSide: Side) {
       summary: `AI Match Summary: The ${winningSide} secured victory in a thrilling campus face-off!`
     }
   });
+  console.log(`[endGame] Match record created. id: ${match.id}`);
 
   // Save MatchPlayer configurations
   for (const player of room.players) {
     if (player.role) {
+      console.log(`[endGame] Creating MatchPlayer record for user ${player.userId}...`);
       await prisma.matchPlayer.create({
         data: {
           matchId: match.id,
@@ -466,20 +594,25 @@ export async function endGame(io: Server, roomId: string, winningSide: Side) {
                (winningSide === 'STUDENTS' && player.role !== 'ASSIGNMENT_MAFIA')
         }
       });
+      console.log(`[endGame] MatchPlayer record created.`);
 
       // Update User Stats
       const won = (winningSide === 'MAFIA' && player.role === 'ASSIGNMENT_MAFIA') ||
                   (winningSide === 'STUDENTS' && player.role !== 'ASSIGNMENT_MAFIA');
       
+      console.log(`[endGame] Finding UserStats for user ${player.userId}...`);
       let stats = await prisma.userStats.findUnique({ where: { userId: player.userId } });
       if (!stats) {
+        console.log(`[endGame] Creating UserStats for user ${player.userId}...`);
         stats = await prisma.userStats.create({
           data: {
             userId: player.userId
           }
         });
+        console.log(`[endGame] UserStats created.`);
       }
 
+      console.log(`[endGame] Updating UserStats for user ${player.userId}...`);
       await prisma.userStats.update({
         where: { userId: player.userId },
         data: {
@@ -490,6 +623,7 @@ export async function endGame(io: Server, roomId: string, winningSide: Side) {
           survivalRate: (stats.survivalRate * stats.totalGames + (player.isAlive ? 100 : 0)) / (stats.totalGames + 1)
         }
       });
+      console.log(`[endGame] UserStats updated.`);
 
       // LAST_BENCHER condition: Win as last student alive
       if (winningSide === 'STUDENTS' && player.role !== 'ASSIGNMENT_MAFIA' && player.isAlive) {

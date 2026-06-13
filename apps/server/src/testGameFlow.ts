@@ -133,6 +133,7 @@ async function runTest() {
     // Check when all are ready to start
     let startEmitted = false;
     socket1.on('room:updated', (room) => {
+      console.log('Room update received by Alice. Players:', room.players.map((p: any) => `${p.userId}: ready=${p.isReady}`));
       const allReady = room.players.every((p: any) => p.isReady);
       if (allReady && room.players.length === 4 && !startEmitted) {
         startEmitted = true;
